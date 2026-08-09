@@ -95,19 +95,20 @@ def get_or_create_student(name: str, ra: str):
         .select("id,name,ra")
         .execute()
     )
-    if not created.data:
-        # Proteção simples para eventual corrida de duas inserções simultâneas.
-        retry = (
-            sb.table("students")
-            .select("id,name,ra")
-            .eq("ra", ra)
-            .limit(1)
-            .execute()
-        )
-        if retry.data:
-            return retry.data[0]
-        raise RuntimeError("Não foi possível criar ou localizar o estudante.")
-    return created.data[0]
+    if created.data:
+        return created.data[0]
+
+    retry = (
+        sb.table("students")
+        .select("id,name,ra")
+        .eq("ra", ra)
+        .limit(1)
+        .execute()
+    )
+    if retry.data:
+        return retry.data[0]
+
+    raise RuntimeError("Não foi possível criar ou localizar o estudante.")
 
 
 def get_or_create_attempt(student_id: str):
@@ -147,6 +148,7 @@ def get_or_create_attempt(student_id: str):
     )
     if retry.data:
         return retry.data[0]
+
     raise RuntimeError("Não foi possível criar ou localizar a tentativa.")
 
 
@@ -170,14 +172,33 @@ def get_responses(attempt_id: str):
         .eq("attempt_id", attempt_id)
         .execute()
     )
-    return {
-        row["question_id"]: row
-        for row in (res.data or [])
-    }
+    return {row["question_id"]: row for row in (res.data or [])}
 
 
-def save_response(attempt_id: str, question_id: str, answer: str):
+def save_first_response(attempt_id: str, question_id: str, answer: str):
+    """
+    Registra apenas a PRIMEIRA resposta.
+    Se a questão já foi respondida, devolve o registro existente sem alterá-lo.
+    """
     sb = get_supabase()
+
+    existing = (
+        sb.table("responses")
+        .select("question_id,answer,is_correct,answered_at")
+        .eq("attempt_id", attempt_id)
+        .eq("question_id", question_id)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        row = existing.data[0]
+        return {
+            "saved": False,
+            "answer": row["answer"],
+            "is_correct": bool(row["is_correct"]),
+            "answered_at": row["answered_at"],
+        }
+
     question = get_question_answer(question_id)
     if not question:
         raise ValueError(f"Questão {question_id} não encontrada.")
@@ -185,27 +206,64 @@ def save_response(attempt_id: str, question_id: str, answer: str):
     is_correct = answer == question["correct_answer"]
     ts = now_iso()
 
-    sb.table("responses").upsert(
-        {
-            "attempt_id": attempt_id,
-            "question_id": question_id,
-            "answer": answer,
-            "is_correct": is_correct,
-            "answered_at": ts,
-        },
-        on_conflict="attempt_id,question_id",
-    ).execute()
+    # A PK composta (attempt_id, question_id) também protege contra duplicidade.
+    try:
+        created = (
+            sb.table("responses")
+            .insert({
+                "attempt_id": attempt_id,
+                "question_id": question_id,
+                "answer": answer,
+                "is_correct": is_correct,
+                "answered_at": ts,
+            })
+            .select("question_id,answer,is_correct,answered_at")
+            .execute()
+        )
+        if created.data:
+            row = created.data[0]
+        else:
+            row = {
+                "answer": answer,
+                "is_correct": is_correct,
+                "answered_at": ts,
+            }
+    except Exception:
+        # Se duas requisições ocorrerem quase simultaneamente, recupera a primeira.
+        retry = (
+            sb.table("responses")
+            .select("question_id,answer,is_correct,answered_at")
+            .eq("attempt_id", attempt_id)
+            .eq("question_id", question_id)
+            .limit(1)
+            .execute()
+        )
+        if not retry.data:
+            raise
+        row = retry.data[0]
 
     sb.table("attempts").update(
         {"updated_at": ts}
     ).eq("id", attempt_id).execute()
 
-    return is_correct
+    return {
+        "saved": True,
+        "answer": row["answer"],
+        "is_correct": bool(row["is_correct"]),
+        "answered_at": row["answered_at"],
+    }
 
 
 def finalize_attempt(attempt_id: str):
     sb = get_supabase()
     ts = now_iso()
+
+    # Só finaliza se todas as questões ativas tiverem resposta.
+    questions = get_questions(include_answers=False)
+    responses = get_responses(attempt_id)
+    if len(responses) < len(questions):
+        raise ValueError("Ainda existem questões obrigatórias sem resposta.")
+
     res = (
         sb.table("attempts")
         .update({"submitted_at": ts, "updated_at": ts})
@@ -214,6 +272,77 @@ def finalize_attempt(attempt_id: str):
         .execute()
     )
     return res.data[0] if res.data else None
+
+
+def get_challenge_submission(attempt_id: str):
+    sb = get_supabase()
+    res = (
+        sb.table("challenge_submissions")
+        .select(
+            "attempt_id,strategy,code_text,test_number,binary_result,"
+            "hex_result,submitted_at"
+        )
+        .eq("attempt_id", attempt_id)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def submit_optional_challenge(
+    attempt_id: str,
+    strategy: str,
+    code_text: str,
+    test_number: str,
+    binary_result: str,
+    hex_result: str,
+):
+    """
+    Desafio opcional: uma única submissão por tentativa.
+    Não é utilizado no cálculo do progresso das 25 questões.
+    """
+    sb = get_supabase()
+
+    existing = get_challenge_submission(attempt_id)
+    if existing:
+        return {"saved": False, **existing}
+
+    attempt = get_attempt(attempt_id)
+    if not attempt or not attempt.get("submitted_at"):
+        raise ValueError(
+            "Finalize primeiro as 25 questões obrigatórias antes de enviar o desafio."
+        )
+
+    ts = now_iso()
+    payload = {
+        "attempt_id": attempt_id,
+        "strategy": strategy.strip(),
+        "code_text": code_text.strip(),
+        "test_number": str(test_number).strip(),
+        "binary_result": binary_result.strip(),
+        "hex_result": hex_result.strip().upper(),
+        "submitted_at": ts,
+    }
+
+    try:
+        created = (
+            sb.table("challenge_submissions")
+            .insert(payload)
+            .select(
+                "attempt_id,strategy,code_text,test_number,binary_result,"
+                "hex_result,submitted_at"
+            )
+            .execute()
+        )
+        if created.data:
+            return {"saved": True, **created.data[0]}
+    except Exception:
+        retry = get_challenge_submission(attempt_id)
+        if retry:
+            return {"saved": False, **retry}
+        raise
+
+    return {"saved": True, **payload}
 
 
 def teacher_dataset():
@@ -242,10 +371,20 @@ def teacher_dataset():
 
     questions = get_questions(include_answers=True)
 
+    challenges = (
+        sb.table("challenge_submissions")
+        .select(
+            "attempt_id,strategy,code_text,test_number,binary_result,"
+            "hex_result,submitted_at"
+        )
+        .execute()
+    ).data or []
+
     attempt_ids = {a["id"] for a in attempts}
     responses = [r for r in responses if r["attempt_id"] in attempt_ids]
+    challenges = [c for c in challenges if c["attempt_id"] in attempt_ids]
 
     student_ids = {a["student_id"] for a in attempts}
     students = [s for s in students if s["id"] in student_ids]
 
-    return students, attempts, responses, questions
+    return students, attempts, responses, questions, challenges
