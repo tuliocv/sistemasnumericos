@@ -2,18 +2,21 @@ import hmac
 import pandas as pd
 import streamlit as st
 
+from ai_feedback import evaluate_challenge, openai_is_configured
 from supabase_db import (
     ACTIVITY_CODE,
     finalize_attempt,
     get_activity,
     get_attempt,
     get_challenge_submission,
+    get_challenge_ai_feedback,
     get_or_create_attempt,
     get_or_create_student,
     get_questions,
     get_responses,
     normalize_ra,
     save_first_response,
+    save_challenge_ai_feedback,
     submit_optional_challenge,
     teacher_dataset,
 )
@@ -446,8 +449,79 @@ def finalization_screen(attempt_id, questions, answers):
         st.rerun()
 
 
+def render_ai_feedback(feedback):
+    total = float(feedback["total_score"])
+
+    st.markdown("### 🤖 Feedback formativo da IA")
+    st.caption(
+        "Este retorno é formativo e não altera sua nota ou o resultado das 25 questões."
+    )
+
+    c1, c2 = st.columns([1, 2])
+    c1.metric("Indicador formativo", f"{total:.1f}/10")
+    c2.info(
+        "A IA foi orientada a não entregar a solução pronta. "
+        "Use o feedback para revisar e explicar melhor a sua própria estratégia."
+    )
+
+    st.markdown("#### 📊 Rubrica")
+    rubric = pd.DataFrame(
+        [
+            ["Lógica Decimal → Binário", float(feedback["binary_logic_score"]), 2],
+            ["Lógica Decimal → Hexadecimal", float(feedback["hexadecimal_logic_score"]), 2],
+            ["Construção do algoritmo", float(feedback["algorithm_score"]), 2],
+            ["Teste e coerência", float(feedback["test_score"]), 2],
+            ["Clareza da explicação", float(feedback["clarity_score"]), 2],
+        ],
+        columns=["Critério", "Pontuação", "Máximo"],
+    )
+    st.dataframe(rubric, use_container_width=True, hide_index=True)
+
+    if feedback.get("strengths"):
+        st.markdown("#### ✅ O que você já construiu bem")
+        for item in feedback["strengths"]:
+            st.write(f"• {item}")
+
+    if feedback.get("areas_to_review"):
+        st.markdown("#### 🔎 O que vale revisar")
+        for item in feedback["areas_to_review"]:
+            st.write(f"• {item}")
+
+    if feedback.get("guiding_questions"):
+        st.markdown("#### 🧠 Perguntas para orientar sua revisão")
+        for i, item in enumerate(feedback["guiding_questions"], start=1):
+            st.write(f"{i}. {item}")
+
+    st.markdown("#### 💡 Próximo passo")
+    st.write(feedback["next_step"])
+
+    st.markdown("#### Síntese")
+    st.write(feedback["formative_summary"])
+
+    st.caption(
+        "Feedback gerado por IA. Ele pode conter imprecisões; o professor pode revisar "
+        "a atividade e o retorno apresentado."
+    )
+
+
+def generate_ai_feedback_for_attempt(attempt_id, submission):
+    existing = get_challenge_ai_feedback(attempt_id)
+    if existing:
+        return existing
+
+    feedback, model, response_id = evaluate_challenge(submission)
+    saved = save_challenge_ai_feedback(
+        attempt_id=attempt_id,
+        feedback=feedback,
+        model=model,
+        openai_response_id=response_id,
+    )
+    return saved
+
+
 def optional_challenge(attempt_id):
     submission = get_challenge_submission(attempt_id)
+    ai_feedback = get_challenge_ai_feedback(attempt_id) if submission else None
 
     st.markdown(
         """
@@ -462,6 +536,11 @@ def optional_challenge(attempt_id):
                 representações em binário e hexadecimal <strong>sem utilizar
                 funções prontas de conversão</strong>.
             </p>
+            <p>
+                Se você enviar, receberá um <strong>feedback formativo por IA</strong>.
+                A IA não deve fornecer a solução pronta: o objetivo é ajudar você a
+                refletir e melhorar sua própria construção.
+            </p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -470,7 +549,7 @@ def optional_challenge(attempt_id):
     if submission:
         st.success("🌟 Desafio de Criação enviado.")
         st.caption(
-            "Sua submissão foi registrada. O desafio opcional permite apenas um envio."
+            "Sua submissão foi registrada e não pode ser alterada."
         )
 
         with st.expander("Visualizar minha submissão"):
@@ -481,8 +560,40 @@ def optional_challenge(attempt_id):
             st.code(submission["code_text"], language="java")
 
             st.write(f"**Número testado:** {submission['test_number']}")
-            st.write(f"**Resultado binário:** {submission['binary_result']}")
-            st.write(f"**Resultado hexadecimal:** {submission['hex_result']}")
+            st.write(f"**Resultado binário informado:** {submission['binary_result']}")
+            st.write(f"**Resultado hexadecimal informado:** {submission['hex_result']}")
+
+        if ai_feedback:
+            render_ai_feedback(ai_feedback)
+            return
+
+        if not openai_is_configured():
+            st.warning(
+                "O desafio foi salvo, mas o feedback por IA ainda não está disponível "
+                "porque a OPENAI_API_KEY não foi configurada no Streamlit."
+            )
+            return
+
+        st.info(
+            "Seu desafio está salvo. O feedback ainda não foi gerado."
+        )
+        if st.button(
+            "Gerar meu feedback formativo",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner(
+                    "Analisando sua estratégia e preparando perguntas orientadoras..."
+                ):
+                    generate_ai_feedback_for_attempt(attempt_id, submission)
+                st.rerun()
+            except Exception as exc:
+                st.error(
+                    "Não foi possível gerar o feedback agora. "
+                    "Sua atividade continua salva e você poderá tentar novamente."
+                )
+                st.caption(str(exc))
         return
 
     with st.expander("Fazer o Desafio de Criação", expanded=False):
@@ -541,7 +652,7 @@ def optional_challenge(attempt_id):
                 return
 
             try:
-                submit_optional_challenge(
+                submission = submit_optional_challenge(
                     attempt_id,
                     strategy,
                     code_text,
@@ -554,8 +665,17 @@ def optional_challenge(attempt_id):
                 st.exception(exc)
                 return
 
-            st.rerun()
+            if openai_is_configured():
+                try:
+                    with st.spinner(
+                        "Desafio salvo. Preparando seu feedback formativo..."
+                    ):
+                        generate_ai_feedback_for_attempt(attempt_id, submission)
+                except Exception:
+                    # A submissão não é perdida se a API estiver temporariamente indisponível.
+                    pass
 
+            st.rerun()
 
 def student_results(attempt_id, answers):
     questions = get_questions(include_answers=True)
@@ -666,16 +786,17 @@ def teacher_login():
 
 
 def build_teacher_frames():
-    students, attempts, responses, questions, challenges = teacher_dataset()
+    students, attempts, responses, questions, challenges, ai_feedbacks = teacher_dataset()
 
     sdf = pd.DataFrame(students)
     adf = pd.DataFrame(attempts)
     rdf = pd.DataFrame(responses)
     qdf = pd.DataFrame(questions)
     cdf = pd.DataFrame(challenges)
+    fdf = pd.DataFrame(ai_feedbacks)
 
     if adf.empty:
-        return sdf, adf, rdf, qdf, cdf, pd.DataFrame()
+        return sdf, adf, rdf, qdf, cdf, fdf, pd.DataFrame()
 
     student_map = (
         sdf.set_index("id")[["name", "ra"]].to_dict("index")
@@ -693,6 +814,11 @@ def build_teacher_frames():
     challenge_ids = (
         set(cdf["attempt_id"].tolist())
         if not cdf.empty else set()
+    )
+
+    feedback_ids = (
+        set(fdf["attempt_id"].tolist())
+        if not fdf.empty else set()
     )
 
     total_questions = len(qdf)
@@ -732,16 +858,25 @@ def build_teacher_frames():
                         else "—"
                     )
                 ),
+                "Feedback IA": (
+                    "Disponível"
+                    if a["id"] in feedback_ids
+                    else (
+                        "Pendente"
+                        if a["id"] in challenge_ids
+                        else "—"
+                    )
+                ),
                 "Última atualização": a.get("updated_at"),
                 "Finalizado em": a.get("submitted_at"),
             }
         )
 
-    return sdf, adf, rdf, qdf, cdf, pd.DataFrame(summary_rows)
+    return sdf, adf, rdf, qdf, cdf, fdf, pd.DataFrame(summary_rows)
 
 
 def teacher_dashboard():
-    sdf, adf, rdf, qdf, cdf, summary = build_teacher_frames()
+    sdf, adf, rdf, qdf, cdf, fdf, summary = build_teacher_frames()
 
     if summary.empty:
         st.info("Nenhum estudante iniciou esta atividade ainda.")
@@ -776,6 +911,7 @@ def teacher_dashboard():
                     "Aproveitamento (%)",
                     "Status",
                     "Desafio",
+                    "Feedback IA",
                     "Última atualização",
                 ]
             ],
@@ -998,6 +1134,15 @@ def teacher_dashboard():
                 cc3.write(
                     f"**Hexadecimal:** {challenge['hex_result']}"
                 )
+
+                if not fdf.empty:
+                    ai_row = fdf[
+                        fdf["attempt_id"] == attempt_id
+                    ]
+                    if not ai_row.empty:
+                        st.markdown("---")
+                        st.markdown("### 🤖 Feedback formativo da IA")
+                        render_ai_feedback(ai_row.iloc[0].to_dict())
 
     st.divider()
     st.subheader("Exportar")

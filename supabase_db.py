@@ -345,6 +345,91 @@ def submit_optional_challenge(
     return {"saved": True, **payload}
 
 
+
+def get_challenge_ai_feedback(attempt_id: str):
+    sb = get_supabase()
+    res = (
+        sb.table("challenge_ai_feedback")
+        .select(
+            "attempt_id,model,openai_response_id,"
+            "binary_logic_score,hexadecimal_logic_score,algorithm_score,"
+            "test_score,clarity_score,total_score,"
+            "strengths,areas_to_review,guiding_questions,"
+            "next_step,formative_summary,created_at"
+        )
+        .eq("attempt_id", attempt_id)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def save_challenge_ai_feedback(
+    attempt_id: str,
+    feedback,
+    model: str,
+    openai_response_id: str | None = None,
+):
+    """
+    Salva apenas um feedback por submissão.
+    Se já existir, retorna o registro existente e não cria uma nova avaliação.
+    """
+    sb = get_supabase()
+
+    existing = get_challenge_ai_feedback(attempt_id)
+    if existing:
+        return {"saved": False, **existing}
+
+    total = round(
+        float(feedback.binary_logic_score)
+        + float(feedback.hexadecimal_logic_score)
+        + float(feedback.algorithm_score)
+        + float(feedback.test_score)
+        + float(feedback.clarity_score),
+        1,
+    )
+
+    payload = {
+        "attempt_id": attempt_id,
+        "model": model,
+        "openai_response_id": openai_response_id,
+        "binary_logic_score": float(feedback.binary_logic_score),
+        "hexadecimal_logic_score": float(feedback.hexadecimal_logic_score),
+        "algorithm_score": float(feedback.algorithm_score),
+        "test_score": float(feedback.test_score),
+        "clarity_score": float(feedback.clarity_score),
+        "total_score": total,
+        "strengths": feedback.strengths,
+        "areas_to_review": feedback.areas_to_review,
+        "guiding_questions": feedback.guiding_questions,
+        "next_step": feedback.next_step,
+        "formative_summary": feedback.formative_summary,
+    }
+
+    try:
+        created = (
+            sb.table("challenge_ai_feedback")
+            .insert(payload)
+            .select(
+                "attempt_id,model,openai_response_id,"
+                "binary_logic_score,hexadecimal_logic_score,algorithm_score,"
+                "test_score,clarity_score,total_score,"
+                "strengths,areas_to_review,guiding_questions,"
+                "next_step,formative_summary,created_at"
+            )
+            .execute()
+        )
+        if created.data:
+            return {"saved": True, **created.data[0]}
+    except Exception:
+        retry = get_challenge_ai_feedback(attempt_id)
+        if retry:
+            return {"saved": False, **retry}
+        raise
+
+    return {"saved": True, **payload}
+
+
 def teacher_dataset():
     """Retorna dados brutos para o painel do professor."""
     sb = get_supabase()
@@ -380,11 +465,24 @@ def teacher_dataset():
         .execute()
     ).data or []
 
+    ai_feedbacks = (
+        sb.table("challenge_ai_feedback")
+        .select(
+            "attempt_id,model,openai_response_id,"
+            "binary_logic_score,hexadecimal_logic_score,algorithm_score,"
+            "test_score,clarity_score,total_score,"
+            "strengths,areas_to_review,guiding_questions,"
+            "next_step,formative_summary,created_at"
+        )
+        .execute()
+    ).data or []
+
     attempt_ids = {a["id"] for a in attempts}
     responses = [r for r in responses if r["attempt_id"] in attempt_ids]
     challenges = [c for c in challenges if c["attempt_id"] in attempt_ids]
+    ai_feedbacks = [f for f in ai_feedbacks if f["attempt_id"] in attempt_ids]
 
     student_ids = {a["student_id"] for a in attempts}
     students = [s for s in students if s["id"] in student_ids]
 
-    return students, attempts, responses, questions, challenges
+    return students, attempts, responses, questions, challenges, ai_feedbacks
