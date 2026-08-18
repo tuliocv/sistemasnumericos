@@ -153,6 +153,12 @@ def secret_value(name: str, default=""):
 
 
 def db_ready():
+    """Valida somente a configuração local.
+
+    Não faz chamada de rede durante o bootstrap do Streamlit. Isso evita que
+    uma conexão lenta/indisponível com o Supabase bloqueie a primeira
+    renderização da página.
+    """
     required = ["SUPABASE_URL", "SUPABASE_SECRET_KEY"]
     missing = [key for key in required if not secret_value(key)]
 
@@ -162,19 +168,6 @@ def db_ready():
             "Configuração incompleta. Faltam Secrets: "
             + ", ".join(missing)
         )
-        return False
-
-    try:
-        activity = get_activity()
-    except Exception as exc:
-        hero()
-        st.error("Não foi possível conectar ao Supabase.")
-        st.exception(exc)
-        return False
-
-    if not activity:
-        hero()
-        st.error(f"A atividade {ACTIVITY_CODE} não foi encontrada.")
         return False
 
     return True
@@ -233,11 +226,24 @@ def student_login():
             return
 
         try:
+            activity = get_activity()
+            if not activity:
+                st.error(
+                    f"A atividade {ACTIVITY_CODE} não foi encontrada no Supabase."
+                )
+                return
+            if not activity.get("active", False):
+                st.warning("Esta atividade está temporariamente desativada.")
+                return
+
             student = get_or_create_student(name, ra)
             attempt = get_or_create_attempt(student["id"])
         except Exception as exc:
-            st.error("Não foi possível iniciar a atividade.")
-            st.exception(exc)
+            st.error(
+                "Não foi possível acessar o Supabase agora. "
+                "A página continua disponível; tente novamente em instantes."
+            )
+            st.caption(f"Detalhe técnico: {exc}")
             return
 
         clear_student_session()
