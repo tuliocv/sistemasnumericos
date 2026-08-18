@@ -1,16 +1,33 @@
 from datetime import datetime, timezone
 import streamlit as st
 from supabase import create_client, Client
+from supabase.client import ClientOptions
 
 ACTIVITY_CODE = "AULA01-SISTNUM"
 
 
 @st.cache_resource
 def get_supabase() -> Client:
-    """Cria um único cliente Supabase por processo do Streamlit."""
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_SECRET_KEY"]
-    return create_client(url, key)
+    """Cria um único cliente Supabase por processo, com timeout de rede.
+
+    Sem timeout explícito, uma conexão problemática pode manter uma chamada
+    bloqueada por tempo suficiente para o Streamlit parecer travado.
+    """
+    url = str(st.secrets["SUPABASE_URL"]).strip()
+    key = str(st.secrets["SUPABASE_SECRET_KEY"]).strip()
+
+    if not url or not key:
+        raise RuntimeError("SUPABASE_URL ou SUPABASE_SECRET_KEY não configurada.")
+
+    return create_client(
+        url,
+        key,
+        options=ClientOptions(
+            postgrest_client_timeout=10,
+            storage_client_timeout=10,
+            schema="public",
+        ),
+    )
 
 
 def now_iso():
