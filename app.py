@@ -2,7 +2,6 @@ import hmac
 import pandas as pd
 import streamlit as st
 
-from ai_feedback import evaluate_challenge, openai_is_configured
 from supabase_db import (
     ACTIVITY_CODE,
     finalize_attempt,
@@ -29,6 +28,19 @@ st.set_page_config(
 )
 
 LEVELS = ["Conceitual", "Fácil", "Médio", "Difícil", "Desafiador"]
+
+
+def openai_is_configured():
+    """Carrega o módulo de IA apenas quando o desafio realmente precisar dele."""
+    from ai_feedback import openai_is_configured as _openai_is_configured
+    return _openai_is_configured()
+
+
+def evaluate_challenge(submission):
+    """Evita importar OpenAI/Pydantic durante a abertura da página inicial."""
+    from ai_feedback import evaluate_challenge as _evaluate_challenge
+    return _evaluate_challenge(submission)
+
 
 st.markdown(
     """
@@ -238,6 +250,8 @@ def student_login():
 
             student = get_or_create_student(name, ra)
             attempt = get_or_create_attempt(student["id"])
+            questions = get_questions()
+            answers = get_responses(attempt["id"])
         except Exception as exc:
             st.error(
                 "Não foi possível acessar o Supabase agora. "
@@ -252,8 +266,6 @@ def student_login():
         st.session_state["student_ra"] = student["ra"]
         st.session_state["attempt_id"] = attempt["id"]
 
-        questions = get_questions()
-        answers = get_responses(attempt["id"])
         st.session_state["current_position"] = get_first_unanswered_index(
             questions, answers
         )
@@ -749,14 +761,39 @@ def student_app():
         return
 
     attempt_id = st.session_state["attempt_id"]
-    attempt = get_attempt(attempt_id)
 
-    if not attempt:
-        clear_student_session()
-        st.rerun()
+    # Mostra uma mensagem imediatamente enquanto uma sessão anterior é retomada.
+    # Assim, uma eventual lentidão do Supabase não deixa a tela aparentemente vazia.
+    status = st.empty()
+    status.info("Reconectando à sua atividade salva...")
 
-    questions = get_questions()
-    answers = get_responses(attempt_id)
+    try:
+        attempt = get_attempt(attempt_id)
+        if not attempt:
+            status.empty()
+            clear_student_session()
+            st.rerun()
+
+        questions = get_questions()
+        answers = get_responses(attempt_id)
+    except Exception as exc:
+        status.empty()
+        hero()
+        st.warning(
+            "Não foi possível retomar sua sessão automaticamente. "
+            "Isso pode ocorrer quando o banco ainda está reconectando."
+        )
+        st.caption(f"Detalhe técnico: {exc}")
+
+        c1, c2 = st.columns(2)
+        if c1.button("Tentar novamente", type="primary", use_container_width=True):
+            st.rerun()
+        if c2.button("Voltar para o login", use_container_width=True):
+            clear_student_session()
+            st.rerun()
+        return
+
+    status.empty()
     sidebar_student(questions, answers)
 
     if attempt.get("submitted_at"):
